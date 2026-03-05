@@ -63,7 +63,6 @@ function addSession(secret) {
 const rateLimit = new Map();
 
 function checkRateLimit(ip) {
-
   const now = Date.now();
   const entry = rateLimit.get(ip);
 
@@ -90,7 +89,6 @@ function checkRateLimit(ip) {
 // =============================
 
 async function verifyTurnstile(token, ip) {
-
   const resp = await fetch(
     "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     {
@@ -116,9 +114,7 @@ async function verifyTurnstile(token, ip) {
 // =============================
 
 app.post("/api/chatkit/session", async (req, res) => {
-
   try {
-
     const ip =
       req.headers["x-forwarded-for"] ||
       req.socket.remoteAddress ||
@@ -169,15 +165,11 @@ app.post("/api/chatkit/session", async (req, res) => {
     res.json({
       client_secret
     });
-
   } catch (error) {
-
     res.status(500).json({
       error: error.message
     });
-
   }
-
 });
 
 // =============================
@@ -185,9 +177,7 @@ app.post("/api/chatkit/session", async (req, res) => {
 // =============================
 
 app.post("/api/chatkit/message", async (req, res) => {
-
   try {
-
     const { client_secret, messages, system_prompt } = req.body;
 
     if (!client_secret || !sessions.has(client_secret)) {
@@ -224,16 +214,30 @@ app.post("/api/chatkit/message", async (req, res) => {
 
     const data = await response.json();
 
-    res.json(data);
+    // Wenn OpenAI einen Fehler zurückgibt (z.B. falscher Key, Quota, Model, Permissions)
+    if (!response.ok) {
+      console.error("OpenAI error:", data);
+      return res.status(response.status).json({
+        error: "openai_error",
+        details: data
+      });
+    }
 
+    // Frontend erwartet { reply: "..." }
+    const reply = data?.choices?.[0]?.message?.content ?? "";
+
+    // Debug, falls reply leer ist
+    if (!reply) {
+      console.error("No reply extracted. Raw OpenAI response:", data);
+    }
+
+    res.json({ reply });
   } catch (error) {
-
+    console.error("OpenAI proxy error:", error);
     res.status(500).json({
       error: error.message
     });
-
   }
-
 });
 
 // =============================
