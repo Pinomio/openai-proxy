@@ -1,28 +1,26 @@
 import express from "express";
+import OpenAI from "openai";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json({ limit: "200kb" }));
 
-// =============================
-// ENV VARIABLES
-// =============================
-
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET;
 
-// =============================
-// ALLOWED ORIGINS
-// =============================
+// Für Produktion besser als Env Var:
+// const OPENAI_WORKFLOW_ID = process.env.OPENAI_WORKFLOW_ID;
+const OPENAI_WORKFLOW_ID =
+  "wf_69a4fdb398488190b1b2c794f4729e71080dd663d949b0e4";
+
+const client = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+});
 
 const ALLOWED_ORIGINS = new Set([
   "https://gastronex.net",
-  "https://www.gastronex.net"
+  "https://www.gastronex.net",
 ]);
-
-// =============================
-// SIMPLE CORS
-// =============================
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -42,24 +40,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// =============================
-// SESSION STORE
-// =============================
-
-const sessions = new Map();
-
-function addSession(secret) {
-  sessions.set(secret, Date.now());
-
-  setTimeout(() => {
-    sessions.delete(secret);
-  }, 1000 * 60 * 30); // 30 Minuten
-}
-
-// =============================
-// RATE LIMIT
-// =============================
-
 const rateLimit = new Map();
 
 function checkRateLimit(ip) {
@@ -76,7 +56,7 @@ function checkRateLimit(ip) {
     return true;
   }
 
-  if (entry.count > 20) {
+  if (entry.count >= 20) {
     return false;
   }
 
@@ -84,39 +64,30 @@ function checkRateLimit(ip) {
   return true;
 }
 
-// =============================
-// TURNSTILE VERIFY
-// =============================
-
 async function verifyTurnstile(token, ip) {
   const resp = await fetch(
     "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Content-Type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({
         secret: TURNSTILE_SECRET,
         response: token,
-        remoteip: ip || ""
-      })
+        remoteip: ip || "",
+      }),
     }
   );
 
   const data = await resp.json();
-
   return data.success === true;
 }
-
-// =============================
-// SESSION ENDPOINT
-// =============================
 
 app.post("/api/chatkit/session", async (req, res) => {
   try {
     const ip =
-      req.headers["x-forwarded-for"] ||
+      req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
       req.socket.remoteAddress ||
       "unknown";
 
@@ -124,136 +95,58 @@ app.post("/api/chatkit/session", async (req, res) => {
       return res.status(429).json({ error: "rate_limited" });
     }
 
-    const { turnstileToken } = req.body;
+    const { turnstileToken, userId } = req.body;
 
     if (!turnstileToken) {
-      return res.status(400).json({
-        error: "missing_turnstile_token"
-      });
+      return res.status(400).json({ error: "missing_turnstile_token" });
+    }
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: "missing_openai_api_key" });
+    }
+
+    if (!TURNSTILE_SECRET) {
+      return res.status(500).json({ error: "missing_turnstile_secret" });
+    }
+
+    if (!OPENAI_WORKFLOW_ID) {
+      return res.status(500).json({ error: "missing_workflow_id" });
     }
 
     const ok = await verifyTurnstile(turnstileToken, ip);
-
     if (!ok) {
-      return res.status(403).json({
-        error: "bot_check_failed"
-      });
+      return res.status(403).json({ error: "bot_check_failed" });
     }
 
-    const response = await fetch(
-      "https://api.openai.com/v1/realtime/sessions",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: OPENAI_MODEL
-        })
-      }
-    );
+    const safeUserId =
+      typeof userId === "string" && userId.trim()
+        ? userId.trim()
+        : `anon_${crypto.randomUUID()}`;
 
-    const data = await response.json();
+    const session = await client.chatkit.sessions.create({
+      workflow: {
+        id: OPENAI_WORKFLOW_ID,
+      },
+      user: safeUserId,
+    });
 
-    const client_secret =
-      data.client_secret?.value ??
-      data.client_secret;
-
-    addSession(client_secret);
-
-    res.json({
-      client_secret
+    return res.json({
+      client_secret: session.client_secret,
     });
   } catch (error) {
-    res.status(500).json({
-      error: error.message
+    console.error("chatkit session error:", error);
+    return res.status(500).json({
+      error: "session_create_failed",
+      details: error?.message || "unknown_error",
     });
   }
 });
-
-// =============================
-// MESSAGE ENDPOINT
-// =============================
-
-app.post("/api/chatkit/message", async (req, res) => {
-  try {
-    const { client_secret, messages, system_prompt } = req.body;
-
-    if (!client_secret || !sessions.has(client_secret)) {
-      return res.status(403).json({
-        error: "invalid_session"
-      });
-    }
-
-    if (!messages) {
-      return res.status(400).json({
-        error: "missing_parameters"
-      });
-    }
-
-    const response = await fetch(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: OPENAI_MODEL,
-          messages: [
-            ...(system_prompt
-              ? [{ role: "system", content: system_prompt }]
-              : []),
-            ...messages
-          ]
-        })
-      }
-    );
-
-    const data = await response.json();
-
-    // Wenn OpenAI einen Fehler zurückgibt (z.B. falscher Key, Quota, Model, Permissions)
-    if (!response.ok) {
-      console.error("OpenAI error:", data);
-      return res.status(response.status).json({
-        error: "openai_error",
-        details: data
-      });
-    }
-
-    // Frontend erwartet { reply: "..." }
-    const reply = data?.choices?.[0]?.message?.content ?? "";
-
-    // Debug, falls reply leer ist
-    if (!reply) {
-      console.error("No reply extracted. Raw OpenAI response:", data);
-    }
-
-    res.json({ reply });
-  } catch (error) {
-    console.error("OpenAI proxy error:", error);
-    res.status(500).json({
-      error: error.message
-    });
-  }
-});
-
-// =============================
-// HEALTH CHECK
-// =============================
 
 app.get("/", (req, res) => {
-  res.send("OpenAI Proxy Running");
+  res.send("ChatKit Proxy Running");
 });
 
-// =============================
-// START SERVER
-// =============================
-
 const port = process.env.PORT || 8080;
-
 app.listen(port, () => {
   console.log("Server running on port", port);
 });
