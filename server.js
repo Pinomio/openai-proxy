@@ -1,5 +1,4 @@
 import express from "express";
-import OpenAI from "openai";
 import crypto from "crypto";
 
 const app = express();
@@ -8,14 +7,9 @@ app.use(express.json({ limit: "200kb" }));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET;
 
-// Für Produktion besser als Env Var:
-// const OPENAI_WORKFLOW_ID = process.env.OPENAI_WORKFLOW_ID;
+// Hart im Code, wie von dir gewünscht
 const OPENAI_WORKFLOW_ID =
   "wf_69a4fdb398488190b1b2c794f4729e71080dd663d949b0e4";
-
-const client = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
 
 const ALLOWED_ORIGINS = new Set([
   "https://gastronex.net",
@@ -47,12 +41,12 @@ function checkRateLimit(ip) {
   const entry = rateLimit.get(ip);
 
   if (!entry) {
-    rateLimit.set(ip, { count: 1, reset: now + 60000 });
+    rateLimit.set(ip, { count: 1, reset: now + 60_000 });
     return true;
   }
 
   if (now > entry.reset) {
-    rateLimit.set(ip, { count: 1, reset: now + 60000 });
+    rateLimit.set(ip, { count: 1, reset: now + 60_000 });
     return true;
   }
 
@@ -86,16 +80,17 @@ async function verifyTurnstile(token, ip) {
 
 app.post("/api/chatkit/session", async (req, res) => {
   try {
+    const forwardedFor = req.headers["x-forwarded-for"];
     const ip =
-      req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
-      req.socket.remoteAddress ||
-      "unknown";
+      typeof forwardedFor === "string"
+        ? forwardedFor.split(",")[0].trim()
+        : req.socket.remoteAddress || "unknown";
 
     if (!checkRateLimit(ip)) {
       return res.status(429).json({ error: "rate_limited" });
     }
 
-    const { turnstileToken, userId } = req.body;
+    const { turnstileToken, userId } = req.body || {};
 
     if (!turnstileToken) {
       return res.status(400).json({ error: "missing_turnstile_token" });
@@ -123,15 +118,33 @@ app.post("/api/chatkit/session", async (req, res) => {
         ? userId.trim()
         : `anon_${crypto.randomUUID()}`;
 
-    const session = await client.chatkit.sessions.create({
-      workflow: {
-        id: OPENAI_WORKFLOW_ID,
+    const response = await fetch("https://api.openai.com/v1/chatkit/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+        "OpenAI-Beta": "chatkit_beta=v1",
       },
-      user: safeUserId,
+      body: JSON.stringify({
+        workflow: {
+          id: OPENAI_WORKFLOW_ID,
+        },
+        user: safeUserId,
+      }),
     });
 
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("OpenAI ChatKit session error:", data);
+      return res.status(response.status).json({
+        error: "session_create_failed",
+        details: data,
+      });
+    }
+
     return res.json({
-      client_secret: session.client_secret,
+      client_secret: data.client_secret,
     });
   } catch (error) {
     console.error("chatkit session error:", error);
